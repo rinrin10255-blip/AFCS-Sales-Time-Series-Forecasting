@@ -174,6 +174,81 @@ def fit_sarimax_and_forecast(
 
     return yhat
 
+# Evaluation on test_evaluation dataset
+def build_daily_series_from_sales(test_df: pd.DataFrame, calendar: pd.DataFrame) -> pd.Series:
+   
+    # melt test_df wide -> long
+    id_cols = [c for c in ["item_id", "dept_id", "cat_id", "store_id", "state_id"] if c in test_df.columns]
+    d_cols = [c for c in test_df.columns if c.startswith("d_")]
+    if len(d_cols) == 0:
+        raise ValueError("No d_ columns found in test_df.")
+
+    long_df = test_df.melt(
+        id_vars=id_cols,
+        value_vars=d_cols,
+        var_name="d",
+        value_name="sales"
+    )
+
+    # merge with calendar to get dates
+    cal = calendar.copy()
+    if "date" not in cal.columns:
+        raise ValueError("calendar must contain a 'date' column.")
+    cal["date"] = pd.to_datetime(cal["date"])
+
+    if "d" not in cal.columns:
+        cal = cal.sort_values("date").reset_index(drop=True)
+        cal["d"] = ["d_" + str(i + 1) for i in range(len(cal))]
+
+    merged = long_df.merge(cal[["d", "date"]], on="d", how="left")
+    if merged["date"].isna().any():
+        raise ValueError("Some 'd' values in test_df could not be matched to calendar dates.")
+
+    # aggregate to daily total
+    y = merged.groupby("date")["sales"].sum().sort_index()
+    y.index = pd.to_datetime(y.index)
+    return y
+
+def evaluate_on_test_evaluation(
+    y_train_all: pd.Series,
+    calendar: pd.DataFrame,
+    out_dir: str,
+) -> float:
+
+    # Load test evaluation data
+    test_df = pd.read_csv(
+        os.path.join("data", "sales_test_evaluation_afcs_2025.csv")
+    )
+    # Build daily total sales series for test evaluation
+    y_test = build_daily_series_from_sales(
+        test_df, calendar
+    )
+
+    h = len(y_test)
+
+    # Build exogenous variables for full train + test horizon
+    exog_all = daily_exog_from_calendar(
+        calendar, y_train_all.index.append(y_test.index)
+    )
+
+    exog_train = exog_all.loc[y_train_all.index]
+    exog_test = exog_all.loc[y_test.index]
+
+    # Fit SARIMAX on FULL training data
+    yhat_test = fit_sarimax_and_forecast(
+        y_train=y_train_all,
+        exog_train=exog_train,
+        exog_future=exog_test,
+        order=CFG.order,
+        seasonal_order=CFG.seasonal_order,
+        h=h,
+    )
+
+    test_rmse = rmse(y_test.values, yhat_test)
+
+    return test_rmse
+
+
 
 # %%
 # Main pipeline
@@ -236,6 +311,14 @@ def main():
     val_df.to_csv(val_path, index=False)
     print(f"[INFO] Saved validation predictions -> {val_path}")
 
+# FINAL evaluation on test_evaluation dataset
+    test_rmse = evaluate_on_test_evaluation(
+        y_train_all=y_all,
+        calendar=calendar,
+        out_dir=out_dir,
+    )
+
+    print(f"[TEST] SARIMAX RMSE on test evaluation dataset: {test_rmse:.4f}")
 
 if __name__ == "__main__":
     main()

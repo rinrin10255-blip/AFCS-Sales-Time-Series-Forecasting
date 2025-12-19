@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Virtual environment
+.venv/
+
+# Logs
+run_log.txt
+*.log
+
+# Generated outputs
+forecasts/
+output/
+outputs/
