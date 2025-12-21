@@ -29,13 +29,21 @@ SHOW_PLOTS = False
 FOCUS_STORE_ID = "TX_3"
 FOCUS_CAT_ID = None
 FOCUS_DEPT_ID = "FOODS_3"
+REPORT_TAG = "tx3_foods3"
 
 
-def finalize_plot(filename: str, fig=None) -> None:
+def report_name(stem: str) -> str:
+    return f"{stem}_{REPORT_TAG}.png"
+
+
+def finalize_plot(filenames: str | list[str], fig=None) -> None:
     fig = fig or plt.gcf()
     if SAVE_EDA:
         os.makedirs(EDA_OUTPUT_DIR, exist_ok=True)
-        fig.savefig(os.path.join(EDA_OUTPUT_DIR, filename), dpi=150, bbox_inches="tight")
+        if isinstance(filenames, str):
+            filenames = [filenames]
+        for filename in filenames:
+            fig.savefig(os.path.join(EDA_OUTPUT_DIR, filename), dpi=150, bbox_inches="tight")
     if SHOW_PLOTS:
         plt.show()
     plt.close(fig)
@@ -174,7 +182,7 @@ def plot_overall_trend(df: pd.DataFrame):
     plt.ylabel("Units sold")
     plt.legend()
     plt.tight_layout()
-    finalize_plot("overall_trend.png")
+    finalize_plot(["overall_trend.png", report_name("overall_trend")])
 
 
 def plot_weekly_seasonality(df: pd.DataFrame):
@@ -196,7 +204,7 @@ def plot_weekly_seasonality(df: pd.DataFrame):
     plt.xlabel("Weekday")
     plt.ylabel("Average units sold")
     plt.tight_layout()
-    finalize_plot("weekly_seasonality.png")
+    finalize_plot(["weekly_seasonality.png", report_name("weekday_effects")])
 
 
 def plot_monthly_seasonality(df: pd.DataFrame):
@@ -215,7 +223,7 @@ def plot_monthly_seasonality(df: pd.DataFrame):
     plt.xlabel("Month")
     plt.ylabel("Average units sold")
     plt.tight_layout()
-    finalize_plot("monthly_seasonality.png")
+    finalize_plot(["monthly_seasonality.png", report_name("monthly_seasonality")])
 
 
 def plot_event_and_snap_effects(df: pd.DataFrame):
@@ -234,7 +242,7 @@ def plot_event_and_snap_effects(df: pd.DataFrame):
     plt.title("Average sales: event vs non-event days")
     plt.ylabel("Average units sold")
     plt.tight_layout()
-    finalize_plot("event_effect.png")
+    finalize_plot(["event_effect.png", report_name("event_effect")])
 
     # SNAP effect 
     if 'snap_TX' in df.columns:
@@ -246,9 +254,25 @@ def plot_event_and_snap_effects(df: pd.DataFrame):
         plt.title("Average sales: SNAP vs non-SNAP days (TX)")
         plt.ylabel("Average units sold")
         plt.tight_layout()
-        finalize_plot("snap_effect.png")
+        finalize_plot(["snap_effect.png", report_name("snap_effect")])
     else:
         print("No 'snap_TX' column; skipping SNAP effect plot.")
+
+    # Combined SNAP + event comparison for report
+    if 'snap_TX' in df.columns:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharey=True)
+        event_mean.plot(kind='bar', ax=axes[0], color="tab:blue")
+        axes[0].set_title("Event vs non-event")
+        axes[0].set_ylabel("Average units sold")
+        axes[0].set_xlabel("")
+
+        snap_mean = df.groupby('snap_TX')['sales'].mean()
+        snap_mean.index = ['Non-SNAP days', 'SNAP days']
+        snap_mean.plot(kind='bar', ax=axes[1], color="tab:green")
+        axes[1].set_title("SNAP vs non-SNAP")
+        axes[1].set_xlabel("")
+        fig.tight_layout()
+        finalize_plot(report_name("snap_event_comparison"), fig=fig)
 
 
 def stl_decomposition(df: pd.DataFrame):
@@ -267,7 +291,7 @@ def stl_decomposition(df: pd.DataFrame):
     fig = result.plot()
     fig.set_size_inches(10, 8)
     plt.tight_layout()
-    finalize_plot("stl_decomposition.png", fig=fig)
+    finalize_plot(["stl_decomposition.png", report_name("stl_decomposition")], fig=fig)
 
 
 def stationarity_adf_test(df: pd.DataFrame):
@@ -303,7 +327,7 @@ def plot_acf_pacf_aggregate(df: pd.DataFrame, nlags: int = 30):
     axes[0].set_title("ACF of total daily sales")
     axes[1].set_title("PACF of total daily sales")
     plt.tight_layout()
-    finalize_plot("acf_pacf_aggregate.png", fig=fig)
+    finalize_plot(["acf_pacf_aggregate.png", report_name("acf_pacf_aggregate")], fig=fig)
 
 
 def item_level_variability(df: pd.DataFrame):
@@ -319,7 +343,7 @@ def item_level_variability(df: pd.DataFrame):
     plt.ylabel("Item sales variance")
     plt.title("Mean–variance relationship across items")
     plt.tight_layout()
-    finalize_plot("item_mean_variance.png")
+    finalize_plot(["item_mean_variance.png", report_name("mean_variance_scatter")])
 
     print(item_stats.describe())
 
@@ -339,7 +363,7 @@ def price_dynamics(df: pd.DataFrame):
     plt.xlabel("Price")
     plt.ylabel("Frequency")
     plt.tight_layout()
-    finalize_plot("price_distribution.png")
+    finalize_plot(["price_distribution.png", report_name("price_distribution")])
 
     # Sample one item for time series analysis
     sample_item_id = df['item_id'].value_counts().index[0]
