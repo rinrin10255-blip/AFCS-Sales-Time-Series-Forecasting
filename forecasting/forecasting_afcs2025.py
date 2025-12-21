@@ -55,7 +55,7 @@ class Config:
     item_level: bool = True
     focus_dept_id: str | None = "FOODS_3"
     focus_store_id: str | None = "TX_3"
-    compare_max_items: int | None = 100
+    compare_max_items: int | None = None
     max_items: int | None = None
     progress_every: int = 100
     models: Tuple[str, ...] = (
