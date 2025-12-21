@@ -1,13 +1,4 @@
-# macOS
 .DS_Store
-
-# Virtual environment
-.venv/
-
-# Logs
-run_log.txt
-*.log
-
-# Generated outputs
-output/
-outputs/
+__pycache__/
+*/__pycache__/
+*.pyc

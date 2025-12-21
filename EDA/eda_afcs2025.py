@@ -26,8 +26,9 @@ SAVE_EDA = True
 SHOW_PLOTS = False
 
 # Light EDA for use
-FOCUS_STORE_ID = None
+FOCUS_STORE_ID = "TX_3"
 FOCUS_CAT_ID = None
+FOCUS_DEPT_ID = "FOODS_3"
 
 
 def finalize_plot(filename: str, fig=None) -> None:
@@ -147,6 +148,10 @@ def optional_filter_focus(df: pd.DataFrame) -> pd.DataFrame:
     if FOCUS_CAT_ID is not None:
         print(f"Filtering to cat_id == {FOCUS_CAT_ID}")
         df_filtered = df_filtered[df_filtered['cat_id'] == FOCUS_CAT_ID]
+
+    if FOCUS_DEPT_ID is not None and 'dept_id' in df_filtered.columns:
+        print(f"Filtering to dept_id == {FOCUS_DEPT_ID}")
+        df_filtered = df_filtered[df_filtered['dept_id'] == FOCUS_DEPT_ID]
 
     print("Shape after optional filter:", df_filtered.shape)
     return df_filtered

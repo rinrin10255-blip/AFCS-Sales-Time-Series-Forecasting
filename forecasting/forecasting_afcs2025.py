@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+import warnings
 from dataclasses import dataclass
 from typing import Tuple
 
@@ -14,10 +15,11 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from statsmodels.stats.diagnostic import acorr_ljungbox
+from statsmodels.tools.sm_exceptions import ValueWarning as SMValueWarning
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
-from EDA.eda_afcs2025 import load_data, prepare_calendar, melt_sales_train, merge_all 
+from EDA.eda_afcs2025 import load_data, prepare_calendar
 
 @dataclass
 class Config:
@@ -46,10 +48,22 @@ class Config:
         "year",
         "snap_TX",
         "has_event",
-        "avg_sell_price",
+        "sell_price",
     )
     save_diagnostics: bool = True
     save_selection_plots: bool = True
+    item_level: bool = True
+    focus_dept_id: str | None = "FOODS_3"
+    focus_store_id: str | None = "TX_3"
+    compare_max_items: int | None = 100
+    max_items: int | None = None
+    progress_every: int = 100
+    models: Tuple[str, ...] = (
+        "SeasonalNaive",
+        "SARIMAX_exog",
+        "SARIMA_no_exog",
+        "ETS_add",
+    )
 
 CFG = Config()
 
@@ -134,6 +148,163 @@ def daily_exog_from_calendar(calendar_prepped: pd.DataFrame, idx: pd.DatetimeInd
     exog = exog.reindex(idx)
     exog = prepare_exog(exog)
     return exog
+
+def exog_from_calendar_by_d(
+    calendar_prepped: pd.DataFrame,
+    d_cols: list[str],
+    use_range_index: bool = True,
+) -> pd.DataFrame:
+    cols = [c for c in CFG.exog_cols if c in calendar_prepped.columns]
+    exog = (
+        calendar_prepped[["d"] + cols]
+        .drop_duplicates("d")
+        .set_index("d")
+        .reindex(d_cols)
+    )
+    exog = prepare_exog(exog)
+    if use_range_index:
+        exog = exog.reset_index(drop=True)
+    return exog
+
+def d_cols_to_dates(
+    calendar_prepped: pd.DataFrame,
+    d_cols: list[str],
+) -> pd.DatetimeIndex:
+    mapper = (
+        calendar_prepped[["d", "date"]]
+        .drop_duplicates("d")
+        .set_index("d")["date"]
+        .to_dict()
+    )
+    dates = [mapper.get(d, None) for d in d_cols]
+    if any(x is None for x in dates):
+        missing = [d_cols[i] for i, x in enumerate(dates) if x is None][:10]
+        raise ValueError(f"Some d values cannot be mapped to dates. Examples: {missing}")
+    return pd.to_datetime(dates)
+
+def prepare_item_level_matrices(
+    sales_train_wide: pd.DataFrame,
+    test_valid_path: str,
+    test_eval_path: str,
+) -> tuple[
+    pd.Index,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    list[str],
+    list[str],
+    list[str],
+    np.ndarray,
+    np.ndarray,
+]:
+    train_df = sales_train_wide.set_index("id")
+    valid_df = pd.read_csv(test_valid_path).set_index("id")
+    test_df = pd.read_csv(test_eval_path).set_index("id")
+
+    if CFG.focus_dept_id:
+        if "dept_id" in train_df.columns:
+            train_df = train_df.loc[train_df["dept_id"] == CFG.focus_dept_id]
+        else:
+            prefix = f"{CFG.focus_dept_id}_"
+            train_df = train_df.loc[train_df.index.str.startswith(prefix)]
+
+    if CFG.focus_store_id:
+        if "store_id" in train_df.columns:
+            train_df = train_df.loc[train_df["store_id"] == CFG.focus_store_id]
+        else:
+            token = f"_{CFG.focus_store_id}_"
+            train_df = train_df.loc[train_df.index.str.contains(token)]
+
+    if CFG.focus_dept_id or CFG.focus_store_id:
+        focus_ids = train_df.index
+        valid_df = valid_df.loc[valid_df.index.intersection(focus_ids)]
+        test_df = test_df.loc[test_df.index.intersection(focus_ids)]
+
+    common_ids = train_df.index.intersection(valid_df.index).intersection(test_df.index)
+    if len(common_ids) == 0:
+        raise ValueError("No common ids across train, validation, and evaluation files.")
+
+    train_df = train_df.loc[common_ids]
+    valid_df = valid_df.loc[common_ids]
+    test_df = test_df.loc[common_ids]
+
+    train_cols = sorted_day_cols(train_df)
+    valid_cols = sorted_day_cols(valid_df)
+    test_cols = sorted_day_cols(test_df)
+
+    train_matrix = train_df[train_cols].to_numpy(dtype=float)
+    valid_matrix = valid_df[valid_cols].to_numpy(dtype=float)
+    test_matrix = test_df[test_cols].to_numpy(dtype=float)
+    item_ids = train_df["item_id"].astype(str).to_numpy()
+    store_ids = train_df["store_id"].astype(str).to_numpy()
+
+    return (
+        common_ids,
+        train_matrix,
+        valid_matrix,
+        test_matrix,
+        train_cols,
+        valid_cols,
+        test_cols,
+        item_ids,
+        store_ids,
+    )
+
+def build_price_matrices(
+    item_ids: np.ndarray,
+    store_ids: np.ndarray,
+    sell_prices: pd.DataFrame,
+    calendar_prepped: pd.DataFrame,
+    train_cols: list[str],
+    valid_cols: list[str],
+    test_cols: list[str],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    d_to_week = (
+        calendar_prepped[["d", "wm_yr_wk"]]
+        .drop_duplicates("d")
+        .set_index("d")["wm_yr_wk"]
+    )
+
+    def weeks_for(cols: list[str]) -> list[int]:
+        weeks = d_to_week.reindex(cols).tolist()
+        if any(pd.isna(weeks)):
+            missing = [cols[i] for i, w in enumerate(weeks) if pd.isna(w)][:10]
+            raise ValueError(f"Missing wm_yr_wk for d columns. Examples: {missing}")
+        return weeks
+
+    weeks_train = weeks_for(train_cols)
+    weeks_valid = weeks_for(valid_cols)
+    weeks_test = weeks_for(test_cols)
+
+    prices = sell_prices.copy()
+    if CFG.focus_store_id:
+        prices = prices.loc[prices["store_id"] == CFG.focus_store_id]
+
+    price_map = {}
+    for (store_id, item_id), grp in prices.groupby(["store_id", "item_id"]):
+        s = grp.set_index("wm_yr_wk")["sell_price"].astype(float).sort_index()
+        price_map[(str(store_id), str(item_id))] = s
+
+    n_items = len(item_ids)
+    price_train = np.zeros((n_items, len(train_cols)), dtype=float)
+    price_valid = np.zeros((n_items, len(valid_cols)), dtype=float)
+    price_test = np.zeros((n_items, len(test_cols)), dtype=float)
+
+    def fill_prices(series: pd.Series, weeks: list[int]) -> np.ndarray:
+        vec = series.reindex(weeks)
+        vec = vec.ffill().bfill().fillna(0.0)
+        return vec.to_numpy(dtype=float)
+
+    for i in range(n_items):
+        key = (store_ids[i], item_ids[i])
+        series = price_map.get(key)
+        if series is None:
+            continue
+        price_train[i, :] = fill_prices(series, weeks_train)
+        price_valid[i, :] = fill_prices(series, weeks_valid)
+        price_test[i, :] = fill_prices(series, weeks_test)
+
+    return price_train, price_valid, price_test
         
 def wide_file_to_daily_total(
     sales_wide: pd.DataFrame,
@@ -257,6 +428,158 @@ def fit_ets_and_forecast(
     yhat = np.clip(yhat, 0, None)
     return yhat
 
+def predict_model(
+    name: str,
+    y_train: pd.Series,
+    exog_train: pd.DataFrame,
+    exog_future: pd.DataFrame,
+    h: int,
+) -> np.ndarray:
+    if name == "SeasonalNaive":
+        return seasonal_naive_forecast(y_train, h=h, season=CFG.seasonal_period)
+    if name == "SARIMAX_exog":
+        return fit_sarimax_and_forecast(
+            y_train=y_train,
+            exog_train=exog_train,
+            exog_future=exog_future,
+            order=CFG.order,
+            seasonal_order=CFG.seasonal_order,
+            h=h,
+        )
+    if name == "SARIMA_no_exog":
+        return fit_sarima_no_exog_and_forecast(
+            y_train=y_train,
+            order=CFG.order,
+            seasonal_order=CFG.seasonal_order,
+            h=h,
+        )
+    if name == "ETS_add":
+        return fit_ets_and_forecast(
+            y_train=y_train,
+            h=h,
+            seasonal_period=CFG.seasonal_period,
+        )
+    raise ValueError(f"Unknown model: {name}")
+
+def evaluate_models_item_level(
+    train_matrix: np.ndarray,
+    valid_matrix: np.ndarray,
+    base_exog_train: pd.DataFrame,
+    base_exog_valid: pd.DataFrame,
+    price_train: np.ndarray,
+    price_valid: np.ndarray,
+    models: Tuple[str, ...],
+    max_items: int | None = None,
+    progress_every: int = 100,
+) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
+    n_items = train_matrix.shape[0]
+    if max_items is not None:
+        n_items = min(n_items, max_items)
+
+    h = valid_matrix.shape[1]
+    preds: dict[str, np.ndarray] = {
+        name: np.zeros((n_items, h), dtype=float) for name in models
+    }
+    fail_counts = {name: 0 for name in models}
+
+    for i in range(n_items):
+        y_train = train_matrix[i]
+        if np.all(y_train == 0):
+            for name in models:
+                preds[name][i, :] = 0.0
+            continue
+
+        y_train_series = pd.Series(y_train, index=base_exog_train.index)
+        naive_pred = seasonal_naive_forecast(
+            y_train_series, h=h, season=CFG.seasonal_period
+        )
+
+        exog_train_i = base_exog_train.copy()
+        exog_valid_i = base_exog_valid.copy()
+        exog_train_i["sell_price"] = price_train[i]
+        exog_valid_i["sell_price"] = price_valid[i]
+
+        for name in models:
+            if name == "SeasonalNaive":
+                preds[name][i, :] = naive_pred
+                continue
+            try:
+                preds[name][i, :] = predict_model(
+                    name=name,
+                    y_train=y_train_series,
+                    exog_train=exog_train_i,
+                    exog_future=exog_valid_i,
+                    h=h,
+                )
+            except Exception as exc:
+                fail_counts[name] += 1
+                preds[name][i, :] = naive_pred
+
+        if progress_every and (i + 1) % progress_every == 0:
+            print(f"[INFO] Processed {i + 1}/{n_items} items")
+
+    y_true = valid_matrix[:n_items].reshape(-1)
+    results = []
+    for name in models:
+        y_pred = preds[name].reshape(-1)
+        results.append(
+            {
+                "model": name,
+                "rmse": rmse(y_true, y_pred),
+                "failures": fail_counts[name],
+                "items_used": n_items,
+            }
+        )
+
+    results_df = pd.DataFrame(results).sort_values("rmse")
+    return results_df, preds
+
+def predict_best_model_item_level(
+    train_matrix: np.ndarray,
+    base_exog_train: pd.DataFrame,
+    base_exog_future: pd.DataFrame,
+    price_train: np.ndarray,
+    price_future: np.ndarray,
+    model_name: str,
+    max_items: int | None = None,
+    progress_every: int = 100,
+) -> np.ndarray:
+    n_items = train_matrix.shape[0]
+    if max_items is not None:
+        n_items = min(n_items, max_items)
+
+    h = exog_future.shape[0]
+    preds = np.zeros((n_items, h), dtype=float)
+
+    for i in range(n_items):
+        y_train = train_matrix[i]
+        if np.all(y_train == 0):
+            preds[i, :] = 0.0
+            continue
+
+        y_train_series = pd.Series(y_train, index=base_exog_train.index)
+        exog_train_i = base_exog_train.copy()
+        exog_future_i = base_exog_future.copy()
+        exog_train_i["sell_price"] = price_train[i]
+        exog_future_i["sell_price"] = price_future[i]
+        try:
+            preds[i, :] = predict_model(
+                name=model_name,
+                y_train=y_train_series,
+                exog_train=exog_train_i,
+                exog_future=exog_future_i,
+                h=h,
+            )
+        except Exception:
+            preds[i, :] = seasonal_naive_forecast(
+                y_train_series, h=h, season=CFG.seasonal_period
+            )
+
+        if progress_every and (i + 1) % progress_every == 0:
+            print(f"[INFO] Processed {i + 1}/{n_items} items for {model_name}")
+
+    return preds
+
 def save_sarimax_diagnostics(res, out_dir: str, prefix: str = "sarimax") -> None:
     summary_path = os.path.join(out_dir, f"{prefix}_summary.txt")
     with open(summary_path, "w") as f:
@@ -352,189 +675,175 @@ def save_acf_pacf_plot(
     fig.savefig(os.path.join(out_dir, filename), dpi=150)
     plt.close(fig)
 
-def load_future_series_from_file(
-    calendar: pd.DataFrame,
-    file_name: str,
-) -> pd.Series:
-    path = os.path.join(PROJECT_ROOT, CFG.data_dir, file_name)
-    df = pd.read_csv(path)
-    return wide_file_to_daily_total(df, calendar)
-
-def forecast_on_wide_file(
-    y_train_all: pd.Series,
-    calendar: pd.DataFrame,
-    file_name: str,
-) -> Tuple[pd.Series, np.ndarray]:
-    test_path = os.path.join(PROJECT_ROOT, CFG.data_dir, file_name)
-    test_df = pd.read_csv(test_path)
-
-    y_future = wide_file_to_daily_total(test_df, calendar)
-
-    exog_all = daily_exog_from_calendar(
-        calendar, y_train_all.index.append(y_future.index)
-    )
-    exog_train = exog_all.loc[y_train_all.index]
-    exog_future = exog_all.loc[y_future.index]
-
-    yhat_future = fit_sarimax_and_forecast(
-        y_train=y_train_all,
-        exog_train=exog_train,
-        exog_future=exog_future,
-        order=CFG.order,
-        seasonal_order=CFG.seasonal_order,
-        h=len(y_future),
-    )
-
-    return y_future, yhat_future
-
-
 # %%
 # Main pipeline
 def main():
     out_dir = ensure_dirs()
     print(f"[INFO] Project ROOT: {CFG.project_root}")
     print(f"[INFO] Outputs will be saved to: {out_dir}")
+    warnings.filterwarnings("ignore", category=SMValueWarning)
+    warnings.filterwarnings(
+        "ignore",
+        message="Could not infer format",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="No supported index is available",
+        category=FutureWarning,
+    )
 
     # 1 Load base data via EDA utilities
-    calendar, sales_train_wide, sell_prices = load_data()
+    calendar, sales_train_wide, sell_prices = load_data(include_id=True)
     calendar = prepare_calendar(calendar)
     calendar = add_has_event(calendar)
-    calendar = add_price_features(calendar, sell_prices)
     calendar["date"] = pd.to_datetime(calendar["date"])
 
-    # 2 Build TRAIN merged df
-    sales_long = melt_sales_train(sales_train_wide) 
-    df_train_merged = merge_all(calendar, sales_long, sell_prices)
-    df_train_merged["date"] = pd.to_datetime(df_train_merged["date"])
+    test_valid_path = os.path.join(PROJECT_ROOT, CFG.data_dir, CFG.test_valid_file)
+    test_eval_path = os.path.join(PROJECT_ROOT, CFG.data_dir, CFG.test_eval_file)
+    (
+        common_ids,
+        train_matrix,
+        valid_matrix,
+        test_matrix,
+        train_cols,
+        valid_cols,
+        test_cols,
+        item_ids,
+        store_ids,
+    ) = prepare_item_level_matrices(
+        sales_train_wide,
+        test_valid_path=test_valid_path,
+        test_eval_path=test_eval_path,
+    )
+    if CFG.focus_dept_id or CFG.focus_store_id:
+        print(
+            f"[INFO] Focus dept_id: {CFG.focus_dept_id}, "
+            f"store_id: {CFG.focus_store_id}, items={len(common_ids)}"
+        )
+    else:
+        print(f"[INFO] All items used: {len(common_ids)}")
 
-    y_all = aggregate_total_daily_sales_from_merged(df_train_merged)
-    print(f"[INFO] Train daily series: {y_all.index.min().date()} -> {y_all.index.max().date()}, n={len(y_all)}")
+    base_exog_train = exog_from_calendar_by_d(calendar, train_cols, use_range_index=True)
+    base_exog_valid = exog_from_calendar_by_d(calendar, valid_cols, use_range_index=True)
+    base_exog_test = exog_from_calendar_by_d(calendar, test_cols, use_range_index=True)
+    price_train, price_valid, price_test = build_price_matrices(
+        item_ids=item_ids,
+        store_ids=store_ids,
+        sell_prices=sell_prices,
+        calendar_prepped=calendar,
+        train_cols=train_cols,
+        valid_cols=valid_cols,
+        test_cols=test_cols,
+    )
 
-    if CFG.save_selection_plots:
-        save_acf_pacf_plot(y_all, out_dir)
-        print("[INFO] Saved ACF/PACF plot.")
+    if CFG.save_selection_plots and len(common_ids) > 0:
+        sample_series = pd.Series(train_matrix[0], index=base_exog_train.index)
+        save_acf_pacf_plot(sample_series, out_dir, filename="acf_pacf_sample_item.png")
+        print("[INFO] Saved ACF/PACF plot (sample item).")
 
-    exog_train = daily_exog_from_calendar(calendar, y_all.index)
-    if CFG.save_diagnostics:
-        res_full = fit_sarimax(
-            y_train=y_all,
-            exog_train=exog_train,
+    if CFG.save_diagnostics and len(common_ids) > 0:
+        sample_series = pd.Series(train_matrix[0], index=base_exog_train.index)
+        exog_train_sample = base_exog_train.copy()
+        exog_train_sample["sell_price"] = price_train[0]
+        res_sample = fit_sarimax(
+            y_train=sample_series,
+            exog_train=exog_train_sample,
             order=CFG.order,
             seasonal_order=CFG.seasonal_order,
         )
-        save_sarimax_diagnostics(res_full, out_dir)
-        print("[INFO] Saved SARIMAX diagnostics artifacts.")
+        save_sarimax_diagnostics(res_sample, out_dir)
+        print(f"[INFO] Saved SARIMAX diagnostics for sample item: {common_ids[0]}")
 
-    # 3 Validation on official test_validation file (aggregate)
-    y_valid = load_future_series_from_file(calendar, CFG.test_valid_file)
-    exog_valid = daily_exog_from_calendar(calendar, y_valid.index)
-    h = len(y_valid)
+    # 2 Fast comparison on a subset of items
+    compare_items = CFG.compare_max_items
+    if CFG.max_items is not None:
+        compare_items = (
+            min(compare_items, CFG.max_items)
+            if compare_items is not None
+            else CFG.max_items
+        )
 
-    preds = {}
-    errors = {}
-
-    def try_model(name: str, fn) -> None:
-        try:
-            preds[name] = fn()
-        except Exception as exc:
-            errors[name] = str(exc)
-            print(f"[WARN] {name} failed: {exc}")
-
-    try_model(
-        "SeasonalNaive",
-        lambda: seasonal_naive_forecast(y_all, h=h, season=CFG.seasonal_period),
-    )
-    try_model(
-        "SARIMAX_exog",
-        lambda: fit_sarimax_and_forecast(
-            y_train=y_all,
-            exog_train=exog_train,
-            exog_future=exog_valid,
-            order=CFG.order,
-            seasonal_order=CFG.seasonal_order,
-            h=h,
-        ),
-    )
-    try_model(
-        "SARIMA_no_exog",
-        lambda: fit_sarima_no_exog_and_forecast(
-            y_train=y_all,
-            order=CFG.order,
-            seasonal_order=CFG.seasonal_order,
-            h=h,
-        ),
-    )
-    try_model(
-        "ETS_add",
-        lambda: fit_ets_and_forecast(
-            y_train=y_all,
-            h=h,
-            seasonal_period=CFG.seasonal_period,
-        ),
+    results_df, preds_subset = evaluate_models_item_level(
+        train_matrix=train_matrix,
+        valid_matrix=valid_matrix,
+        base_exog_train=base_exog_train,
+        base_exog_valid=base_exog_valid,
+        price_train=price_train,
+        price_valid=price_valid,
+        models=CFG.models,
+        max_items=compare_items,
+        progress_every=CFG.progress_every,
     )
 
-    results = []
-    for name, pred in preds.items():
-        results.append({"model": name, "rmse": rmse(y_valid.values, pred)})
-
-    results_df = pd.DataFrame(results).sort_values("rmse")
     comparison_path = os.path.join(out_dir, "model_comparison_validation.csv")
     results_df.to_csv(comparison_path, index=False)
-    print("[VAL] Model comparison (RMSE):")
+    print(
+        f"[VAL] Model comparison (RMSE) on {results_df['items_used'].iloc[0]} items:"
+    )
     for row in results_df.itertuples(index=False):
         print(f"  {row.model}: {row.rmse:.4f}")
     print(f"[INFO] Saved model comparison -> {comparison_path}")
 
     best_model = results_df.iloc[0]["model"]
-    best_pred = preds[best_model]
+    print(f"[INFO] Best model from subset: {best_model}")
 
-    save_prediction_plot(
-        dates=y_valid.index,
-        y_true=y_valid.values,
-        y_pred=best_pred,
-        out_dir=out_dir,
-        filename=f"validation_actual_vs_pred_{best_model}.png",
-        title=f"Validation: Actual vs Forecast ({best_model})",
+    full_items = len(common_ids)
+    if CFG.max_items is not None:
+        full_items = min(full_items, CFG.max_items)
+
+    # 3 Full validation for the best model
+    best_pred_valid_full = predict_best_model_item_level(
+        train_matrix=train_matrix,
+        base_exog_train=base_exog_train,
+        base_exog_future=base_exog_valid,
+        price_train=price_train,
+        price_future=price_valid,
+        model_name=best_model,
+        max_items=full_items,
+        progress_every=CFG.progress_every,
     )
-    print("[INFO] Saved validation plot.")
+    valid_rmse_full = rmse(
+        valid_matrix[:full_items].reshape(-1),
+        best_pred_valid_full.reshape(-1),
+    )
+    print(f"[VAL] {best_model} RMSE (full validation): {valid_rmse_full:.4f}")
 
-    # 4 Final evaluation on test_evaluation file (aggregate)
-    y_test = load_future_series_from_file(calendar, CFG.test_eval_file)
-    exog_test = daily_exog_from_calendar(calendar, y_test.index)
+    valid_dates = d_cols_to_dates(calendar, valid_cols)
+    valid_actual_total = valid_matrix[:full_items].sum(axis=0)
+    valid_pred_total = best_pred_valid_full.sum(axis=0)
+    save_prediction_plot(
+        dates=valid_dates,
+        y_true=valid_actual_total,
+        y_pred=valid_pred_total,
+        out_dir=out_dir,
+        filename=f"validation_total_actual_vs_pred_{best_model}.png",
+        title=f"Validation Total: Actual vs Forecast ({best_model})",
+    )
+    print("[INFO] Saved validation total plot.")
 
-    if best_model == "SeasonalNaive":
-        test_pred = seasonal_naive_forecast(
-            y_all, h=len(y_test), season=CFG.seasonal_period
-        )
-    elif best_model == "SARIMAX_exog":
-        test_pred = fit_sarimax_and_forecast(
-            y_train=y_all,
-            exog_train=exog_train,
-            exog_future=exog_test,
-            order=CFG.order,
-            seasonal_order=CFG.seasonal_order,
-            h=len(y_test),
-        )
-    elif best_model == "SARIMA_no_exog":
-        test_pred = fit_sarima_no_exog_and_forecast(
-            y_train=y_all,
-            order=CFG.order,
-            seasonal_order=CFG.seasonal_order,
-            h=len(y_test),
-        )
-    elif best_model == "ETS_add":
-        test_pred = fit_ets_and_forecast(
-            y_train=y_all,
-            h=len(y_test),
-            seasonal_period=CFG.seasonal_period,
-        )
-    else:
-        raise ValueError(f"Unknown best model: {best_model}")
+    # 4 Final evaluation on test_evaluation file (item-level)
+    test_pred = predict_best_model_item_level(
+        train_matrix=train_matrix,
+        base_exog_train=base_exog_train,
+        base_exog_future=base_exog_test,
+        price_train=price_train,
+        price_future=price_test,
+        model_name=best_model,
+        max_items=full_items,
+        progress_every=CFG.progress_every,
+    )
 
-    test_rmse = rmse(y_test.values, test_pred)
+    test_rmse = rmse(
+        test_matrix[:full_items].reshape(-1),
+        test_pred.reshape(-1),
+    )
+    test_out = os.path.join(out_dir, "test_predictions_item_level.csv")
+    test_df = pd.DataFrame(test_pred, columns=test_cols)
+    test_df.insert(0, "id", common_ids[:full_items])
+    test_df.to_csv(test_out, index=False)
+    print(f"[INFO] Saved test predictions -> {test_out}")
     print(f"[TEST] {best_model} RMSE on test evaluation dataset: {test_rmse:.4f}")
-
-    # 5 No submission file is generated for this project.
 
 
 if __name__ == "__main__":
