@@ -8,7 +8,12 @@ from typing import Tuple
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+from statistics import NormalDist
 from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.stats.diagnostic import acorr_ljungbox
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
@@ -43,6 +48,8 @@ class Config:
         "has_event",
         "avg_sell_price",
     )
+    save_diagnostics: bool = True
+    save_selection_plots: bool = True
 
 CFG = Config()
 
@@ -166,19 +173,15 @@ def seasonal_naive_forecast(y_train: pd.Series, h: int, season: int) -> np.ndarr
     reps = int(np.ceil(h / season))
     return np.tile(last_season, reps)[:h]
 
-
-def fit_sarimax_and_forecast(
+def fit_sarimax(
     y_train: pd.Series,
     exog_train: pd.DataFrame,
-    exog_future: pd.DataFrame,
     order: Tuple[int, int, int],
     seasonal_order: Tuple[int, int, int, int],
-    h: int
-) -> np.ndarray:
+):
     y = y_train.astype("float64").copy()
     y_log = np.log1p(y)
     X_train = exog_train.astype("float64")
-    X_future = exog_future.astype("float64")
 
     model = SARIMAX(
         y_log,
@@ -189,6 +192,20 @@ def fit_sarimax_and_forecast(
         enforce_invertibility=False,
     )
     res = model.fit(disp=False, maxiter=200)
+    return res
+
+
+def fit_sarimax_and_forecast(
+    y_train: pd.Series,
+    exog_train: pd.DataFrame,
+    exog_future: pd.DataFrame,
+    order: Tuple[int, int, int],
+    seasonal_order: Tuple[int, int, int, int],
+    h: int
+) -> np.ndarray:
+    res = fit_sarimax(y_train, exog_train, order, seasonal_order)
+    X_future = exog_future.astype("float64")
+
     fcast = res.get_forecast(steps=h, exog=X_future)
 
     yhat_log = fcast.predicted_mean
@@ -197,6 +214,151 @@ def fit_sarimax_and_forecast(
     yhat = np.clip(yhat, 0, None)
 
     return yhat
+
+def fit_sarima_no_exog_and_forecast(
+    y_train: pd.Series,
+    order: Tuple[int, int, int],
+    seasonal_order: Tuple[int, int, int, int],
+    h: int,
+) -> np.ndarray:
+    y = y_train.astype("float64").copy()
+    y_log = np.log1p(y)
+
+    model = SARIMAX(
+        y_log,
+        order=order,
+        seasonal_order=seasonal_order,
+        enforce_stationarity=False,
+        enforce_invertibility=False,
+    )
+    res = model.fit(disp=False, maxiter=200)
+    fcast = res.get_forecast(steps=h)
+
+    yhat_log = fcast.predicted_mean
+    yhat = np.expm1(yhat_log).values
+    yhat = np.clip(yhat, 0, None)
+    return yhat
+
+def fit_ets_and_forecast(
+    y_train: pd.Series,
+    h: int,
+    seasonal_period: int,
+) -> np.ndarray:
+    model = ExponentialSmoothing(
+        y_train.astype("float64"),
+        trend="add",
+        seasonal="add",
+        seasonal_periods=seasonal_period,
+        initialization_method="estimated",
+    )
+    res = model.fit(optimized=True)
+    yhat = res.forecast(h)
+    yhat = np.asarray(yhat, dtype=float)
+    yhat = np.clip(yhat, 0, None)
+    return yhat
+
+def save_sarimax_diagnostics(res, out_dir: str, prefix: str = "sarimax") -> None:
+    summary_path = os.path.join(out_dir, f"{prefix}_summary.txt")
+    with open(summary_path, "w") as f:
+        f.write(res.summary().as_text())
+
+    params = pd.Series(res.params, index=res.param_names, name="coef")
+    params.to_csv(os.path.join(out_dir, f"{prefix}_params.csv"), header=True)
+
+    resid = pd.Series(res.resid, name="resid").dropna()
+    lb = acorr_ljungbox(resid, lags=[7, 14, 21, 28], return_df=True)
+    lb.to_csv(os.path.join(out_dir, f"{prefix}_ljungbox.csv"), index=False)
+
+    try:
+        fig = res.plot_diagnostics(figsize=(12, 8))
+        fig.savefig(
+            os.path.join(out_dir, f"{prefix}_diagnostics.png"),
+            dpi=150,
+            bbox_inches="tight",
+        )
+        plt.close(fig)
+        return
+    except Exception as exc:
+        print(f"[WARN] Diagnostics plot failed ({exc}); writing fallback plot.")
+
+    resid = pd.Series(res.resid, name="resid").dropna()
+    if resid.empty:
+        return
+
+    mu = float(resid.mean())
+    sigma = float(resid.std(ddof=1)) or 1.0
+    n = len(resid)
+    probs = (np.arange(1, n + 1) - 0.5) / n
+    normal = NormalDist(mu, sigma)
+    theo = np.array([normal.inv_cdf(p) for p in probs])
+    samp = np.sort(resid.values)
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    axes[0, 0].plot(resid.index, resid.values, color="tab:blue")
+    axes[0, 0].set_title("Residuals over time")
+
+    axes[0, 1].hist(resid.values, bins=40, density=True, color="tab:gray", alpha=0.7)
+    x = np.linspace(mu - 4 * sigma, mu + 4 * sigma, 200)
+    pdf = (1.0 / (sigma * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
+    axes[0, 1].plot(x, pdf, color="tab:red")
+    axes[0, 1].set_title("Residual histogram")
+
+    axes[1, 0].scatter(theo, samp, s=10, alpha=0.6)
+    axes[1, 0].plot([theo.min(), theo.max()], [theo.min(), theo.max()], color="tab:red")
+    axes[1, 0].set_title("QQ plot (normal)")
+
+    plot_acf(resid, lags=30, ax=axes[1, 1])
+    axes[1, 1].set_title("Residual ACF")
+
+    fig.tight_layout()
+    fig.savefig(
+        os.path.join(out_dir, f"{prefix}_diagnostics.png"),
+        dpi=150,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+def save_prediction_plot(
+    dates: pd.DatetimeIndex,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    out_dir: str,
+    filename: str,
+    title: str,
+) -> None:
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(dates, y_true, label="Actual", linewidth=2)
+    ax.plot(dates, y_pred, label="Forecast", linewidth=2)
+    ax.set_title(title)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Units sold")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, filename), dpi=150)
+    plt.close(fig)
+
+def save_acf_pacf_plot(
+    y_series: pd.Series,
+    out_dir: str,
+    filename: str = "acf_pacf.png",
+    nlags: int = 30,
+) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    plot_acf(y_series, lags=nlags, ax=axes[0])
+    plot_pacf(y_series, lags=nlags, ax=axes[1])
+    axes[0].set_title("ACF of total daily sales")
+    axes[1].set_title("PACF of total daily sales")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, filename), dpi=150)
+    plt.close(fig)
+
+def load_future_series_from_file(
+    calendar: pd.DataFrame,
+    file_name: str,
+) -> pd.Series:
+    path = os.path.join(PROJECT_ROOT, CFG.data_dir, file_name)
+    df = pd.read_csv(path)
+    return wide_file_to_daily_total(df, calendar)
 
 def forecast_on_wide_file(
     y_train_all: pd.Series,
@@ -248,29 +410,129 @@ def main():
     y_all = aggregate_total_daily_sales_from_merged(df_train_merged)
     print(f"[INFO] Train daily series: {y_all.index.min().date()} -> {y_all.index.max().date()}, n={len(y_all)}")
 
-    # 3 Validation on official test_validation file (aggregate)
-    y_valid, sarimax_pred_valid = forecast_on_wide_file(
-        y_train_all=y_all,
-        calendar=calendar,
-        file_name=CFG.test_valid_file,
-    )
-    h = len(y_valid)
-    naive_pred_valid = seasonal_naive_forecast(y_all, h=h, season=CFG.seasonal_period)
-    naive_rmse = rmse(y_valid.values, naive_pred_valid)
-    sarimax_rmse = rmse(y_valid.values, sarimax_pred_valid)
-    print(f"[VAL] Seasonal-Naive RMSE (official validation): {naive_rmse:.4f}")
-    print(f"[VAL] SARIMAX RMSE (official validation): {sarimax_rmse:.4f}")
+    if CFG.save_selection_plots:
+        save_acf_pacf_plot(y_all, out_dir)
+        print("[INFO] Saved ACF/PACF plot.")
 
-    # Validation predictions are not saved to disk for this project.
+    exog_train = daily_exog_from_calendar(calendar, y_all.index)
+    if CFG.save_diagnostics:
+        res_full = fit_sarimax(
+            y_train=y_all,
+            exog_train=exog_train,
+            order=CFG.order,
+            seasonal_order=CFG.seasonal_order,
+        )
+        save_sarimax_diagnostics(res_full, out_dir)
+        print("[INFO] Saved SARIMAX diagnostics artifacts.")
+
+    # 3 Validation on official test_validation file (aggregate)
+    y_valid = load_future_series_from_file(calendar, CFG.test_valid_file)
+    exog_valid = daily_exog_from_calendar(calendar, y_valid.index)
+    h = len(y_valid)
+
+    preds = {}
+    errors = {}
+
+    def try_model(name: str, fn) -> None:
+        try:
+            preds[name] = fn()
+        except Exception as exc:
+            errors[name] = str(exc)
+            print(f"[WARN] {name} failed: {exc}")
+
+    try_model(
+        "SeasonalNaive",
+        lambda: seasonal_naive_forecast(y_all, h=h, season=CFG.seasonal_period),
+    )
+    try_model(
+        "SARIMAX_exog",
+        lambda: fit_sarimax_and_forecast(
+            y_train=y_all,
+            exog_train=exog_train,
+            exog_future=exog_valid,
+            order=CFG.order,
+            seasonal_order=CFG.seasonal_order,
+            h=h,
+        ),
+    )
+    try_model(
+        "SARIMA_no_exog",
+        lambda: fit_sarima_no_exog_and_forecast(
+            y_train=y_all,
+            order=CFG.order,
+            seasonal_order=CFG.seasonal_order,
+            h=h,
+        ),
+    )
+    try_model(
+        "ETS_add",
+        lambda: fit_ets_and_forecast(
+            y_train=y_all,
+            h=h,
+            seasonal_period=CFG.seasonal_period,
+        ),
+    )
+
+    results = []
+    for name, pred in preds.items():
+        results.append({"model": name, "rmse": rmse(y_valid.values, pred)})
+
+    results_df = pd.DataFrame(results).sort_values("rmse")
+    comparison_path = os.path.join(out_dir, "model_comparison_validation.csv")
+    results_df.to_csv(comparison_path, index=False)
+    print("[VAL] Model comparison (RMSE):")
+    for row in results_df.itertuples(index=False):
+        print(f"  {row.model}: {row.rmse:.4f}")
+    print(f"[INFO] Saved model comparison -> {comparison_path}")
+
+    best_model = results_df.iloc[0]["model"]
+    best_pred = preds[best_model]
+
+    save_prediction_plot(
+        dates=y_valid.index,
+        y_true=y_valid.values,
+        y_pred=best_pred,
+        out_dir=out_dir,
+        filename=f"validation_actual_vs_pred_{best_model}.png",
+        title=f"Validation: Actual vs Forecast ({best_model})",
+    )
+    print("[INFO] Saved validation plot.")
 
     # 4 Final evaluation on test_evaluation file (aggregate)
-    y_test, sarimax_pred_test = forecast_on_wide_file(
-        y_train_all=y_all,
-        calendar=calendar,
-        file_name=CFG.test_eval_file,
-    )
-    test_rmse = rmse(y_test.values, sarimax_pred_test)
-    print(f"[TEST] SARIMAX RMSE on test evaluation dataset: {test_rmse:.4f}")
+    y_test = load_future_series_from_file(calendar, CFG.test_eval_file)
+    exog_test = daily_exog_from_calendar(calendar, y_test.index)
+
+    if best_model == "SeasonalNaive":
+        test_pred = seasonal_naive_forecast(
+            y_all, h=len(y_test), season=CFG.seasonal_period
+        )
+    elif best_model == "SARIMAX_exog":
+        test_pred = fit_sarimax_and_forecast(
+            y_train=y_all,
+            exog_train=exog_train,
+            exog_future=exog_test,
+            order=CFG.order,
+            seasonal_order=CFG.seasonal_order,
+            h=len(y_test),
+        )
+    elif best_model == "SARIMA_no_exog":
+        test_pred = fit_sarima_no_exog_and_forecast(
+            y_train=y_all,
+            order=CFG.order,
+            seasonal_order=CFG.seasonal_order,
+            h=len(y_test),
+        )
+    elif best_model == "ETS_add":
+        test_pred = fit_ets_and_forecast(
+            y_train=y_all,
+            h=len(y_test),
+            seasonal_period=CFG.seasonal_period,
+        )
+    else:
+        raise ValueError(f"Unknown best model: {best_model}")
+
+    test_rmse = rmse(y_test.values, test_pred)
+    print(f"[TEST] {best_model} RMSE on test evaluation dataset: {test_rmse:.4f}")
 
     # 5 No submission file is generated for this project.
 
