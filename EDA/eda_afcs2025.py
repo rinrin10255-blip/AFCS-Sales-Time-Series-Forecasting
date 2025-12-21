@@ -10,8 +10,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-os.chdir(PROJECT_ROOT)
-print("Working directory set to:", os.getcwd())
 
 from statsmodels.tsa.seasonal import STL
 from statsmodels.tsa.stattools import adfuller
@@ -19,7 +17,7 @@ from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 
 plt.style.use("default")
 
-DATA_DIR = "data"
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 CALENDAR_PATH = os.path.join(DATA_DIR, "calendar_afcs2025.csv")
 SALES_TRAIN_PATH = os.path.join(DATA_DIR, "sales_train_validation_afcs2025.csv")
 SELL_PRICES_PATH = os.path.join(DATA_DIR, "sell_prices_afcs2025.csv")
@@ -31,7 +29,7 @@ FOCUS_CAT_ID = None
 
 # 1. LOAD DATA
 
-def load_data():
+def load_data(include_id: bool = False):
     print("Loading data...")
     calendar = pd.read_csv(CALENDAR_PATH)
     sales_train = pd.read_csv(SALES_TRAIN_PATH)
@@ -45,16 +43,16 @@ def load_data():
     sales_train["store_id"] = parts[3] + "_" + parts[4]
 
     day_cols = [c for c in sales_train.columns if c.startswith("d_")]
-    sales_train = sales_train[
-        ["item_id", "dept_id", "cat_id", "store_id", "state_id"] + day_cols
-    ]
+    base_cols = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
+    if include_id:
+        base_cols = ["id"] + base_cols
 
-    print("\n--- calendar columns ---")
-    print(calendar.columns.tolist())
-    print("\n--- sales_train columns ---")
-    print(sales_train.columns.tolist())
-    print("\n--- sell_prices columns ---")
-    print(sell_prices.columns.tolist())
+    sales_train = sales_train[base_cols + day_cols]
+
+    print("\n--- dataset shapes ---")
+    print(f"calendar: {calendar.shape[0]} rows, {calendar.shape[1]} cols")
+    print(f"sales_train: {sales_train.shape[0]} rows, {sales_train.shape[1]} cols")
+    print(f"sell_prices: {sell_prices.shape[0]} rows, {sell_prices.shape[1]} cols")
 
     return calendar, sales_train, sell_prices
 
@@ -76,7 +74,6 @@ def prepare_calendar(calendar: pd.DataFrame) -> pd.DataFrame:
 
     # Ensure 'd' column exists
     if 'd' not in calendar.columns:
-        print("No 'd' column in calendar; creating one based on sorted date...")
         calendar = calendar.sort_values('date').reset_index(drop=True)
         calendar['d'] = 'd_' + (calendar.index + 1).astype(str)
     else:
@@ -402,30 +399,22 @@ def hierarchical_structure(df: pd.DataFrame):
 
 
 # %% 
-calendar, sales_train, sell_prices = load_data()
+def main():
+    calendar, sales_train, sell_prices = load_data()
 
-calendar = prepare_calendar(calendar)
-sales_long = melt_sales_train(sales_train)
-df = merge_all(calendar, sales_long, sell_prices)
-df = optional_filter_focus(df)
+    calendar = prepare_calendar(calendar)
+    sales_long = melt_sales_train(sales_train)
+    df = merge_all(calendar, sales_long, sell_prices)
+    df = optional_filter_focus(df)
 
-df.head()
-# %%
-# %%
-plot_overall_trend(df)
+    df.head()
+    plot_overall_trend(df)
+    plot_weekly_seasonality(df)
+    plot_monthly_seasonality(df)
+    plot_event_and_snap_effects(df)
+    stl_decomposition(df)
+    plot_acf_pacf_aggregate(df)
 
-# %%
-plot_weekly_seasonality(df)
 
-# %%
-plot_monthly_seasonality(df)
-
-# %%
-plot_event_and_snap_effects(df)
-
-# %%
-stl_decomposition(df)
-
-# %%
-plot_acf_pacf_aggregate(df)
-# %%
+if __name__ == "__main__":
+    main()
