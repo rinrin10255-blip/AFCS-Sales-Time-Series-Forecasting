@@ -548,7 +548,7 @@ def predict_best_model_item_level(
     if max_items is not None:
         n_items = min(n_items, max_items)
 
-    h = exog_future.shape[0]
+    h = base_exog_future.shape[0]
     preds = np.zeros((n_items, h), dtype=float)
 
     for i in range(n_items):
