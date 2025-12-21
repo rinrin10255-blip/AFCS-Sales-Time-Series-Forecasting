@@ -21,10 +21,23 @@ DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 CALENDAR_PATH = os.path.join(DATA_DIR, "calendar_afcs2025.csv")
 SALES_TRAIN_PATH = os.path.join(DATA_DIR, "sales_train_validation_afcs2025.csv")
 SELL_PRICES_PATH = os.path.join(DATA_DIR, "sell_prices_afcs2025.csv")
+EDA_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "eda_outputs")
+SAVE_EDA = True
+SHOW_PLOTS = False
 
 # Light EDA for use
 FOCUS_STORE_ID = None
 FOCUS_CAT_ID = None
+
+
+def finalize_plot(filename: str, fig=None) -> None:
+    fig = fig or plt.gcf()
+    if SAVE_EDA:
+        os.makedirs(EDA_OUTPUT_DIR, exist_ok=True)
+        fig.savefig(os.path.join(EDA_OUTPUT_DIR, filename), dpi=150, bbox_inches="tight")
+    if SHOW_PLOTS:
+        plt.show()
+    plt.close(fig)
 
 
 # 1. LOAD DATA
@@ -156,7 +169,7 @@ def plot_overall_trend(df: pd.DataFrame):
     plt.ylabel("Units sold")
     plt.legend()
     plt.tight_layout()
-    plt.show()
+    finalize_plot("overall_trend.png")
 
 
 def plot_weekly_seasonality(df: pd.DataFrame):
@@ -178,7 +191,7 @@ def plot_weekly_seasonality(df: pd.DataFrame):
     plt.xlabel("Weekday")
     plt.ylabel("Average units sold")
     plt.tight_layout()
-    plt.show()
+    finalize_plot("weekly_seasonality.png")
 
 
 def plot_monthly_seasonality(df: pd.DataFrame):
@@ -197,7 +210,7 @@ def plot_monthly_seasonality(df: pd.DataFrame):
     plt.xlabel("Month")
     plt.ylabel("Average units sold")
     plt.tight_layout()
-    plt.show()
+    finalize_plot("monthly_seasonality.png")
 
 
 def plot_event_and_snap_effects(df: pd.DataFrame):
@@ -216,7 +229,7 @@ def plot_event_and_snap_effects(df: pd.DataFrame):
     plt.title("Average sales: event vs non-event days")
     plt.ylabel("Average units sold")
     plt.tight_layout()
-    plt.show()
+    finalize_plot("event_effect.png")
 
     # SNAP effect 
     if 'snap_TX' in df.columns:
@@ -228,7 +241,7 @@ def plot_event_and_snap_effects(df: pd.DataFrame):
         plt.title("Average sales: SNAP vs non-SNAP days (TX)")
         plt.ylabel("Average units sold")
         plt.tight_layout()
-        plt.show()
+        finalize_plot("snap_effect.png")
     else:
         print("No 'snap_TX' column; skipping SNAP effect plot.")
 
@@ -249,7 +262,7 @@ def stl_decomposition(df: pd.DataFrame):
     fig = result.plot()
     fig.set_size_inches(10, 8)
     plt.tight_layout()
-    plt.show()
+    finalize_plot("stl_decomposition.png", fig=fig)
 
 
 def stationarity_adf_test(df: pd.DataFrame):
@@ -285,7 +298,7 @@ def plot_acf_pacf_aggregate(df: pd.DataFrame, nlags: int = 30):
     axes[0].set_title("ACF of total daily sales")
     axes[1].set_title("PACF of total daily sales")
     plt.tight_layout()
-    plt.show()
+    finalize_plot("acf_pacf_aggregate.png", fig=fig)
 
 
 def item_level_variability(df: pd.DataFrame):
@@ -301,7 +314,7 @@ def item_level_variability(df: pd.DataFrame):
     plt.ylabel("Item sales variance")
     plt.title("Mean–variance relationship across items")
     plt.tight_layout()
-    plt.show()
+    finalize_plot("item_mean_variance.png")
 
     print(item_stats.describe())
 
@@ -321,7 +334,7 @@ def price_dynamics(df: pd.DataFrame):
     plt.xlabel("Price")
     plt.ylabel("Frequency")
     plt.tight_layout()
-    plt.show()
+    finalize_plot("price_distribution.png")
 
     # Sample one item for time series analysis
     sample_item_id = df['item_id'].value_counts().index[0]
@@ -338,7 +351,7 @@ def price_dynamics(df: pd.DataFrame):
     ax2.set_ylabel("Price")
     plt.title(f"Sales and price over time for item {sample_item_id}")
     fig.tight_layout()
-    plt.show()
+    finalize_plot("price_sales_timeseries.png", fig=fig)
 
     # Scatter sales vs price (sample subset to reduce noise)
     sample_for_scatter = df[['sell_price', 'sales']].dropna().sample(
@@ -353,7 +366,7 @@ def price_dynamics(df: pd.DataFrame):
     plt.ylabel("Units sold")
     plt.title("Sales vs price (sample)")
     plt.tight_layout()
-    plt.show()
+    finalize_plot("price_sales_scatter.png")
 
 
 def hierarchical_structure(df: pd.DataFrame):
@@ -368,7 +381,7 @@ def hierarchical_structure(df: pd.DataFrame):
         plt.title("Total sales by category")
         plt.ylabel("Total units sold")
         plt.tight_layout()
-        plt.show()
+        finalize_plot("category_sales.png")
         print("\nCategory-level total sales:")
         print(cat_total)
 
@@ -380,7 +393,7 @@ def hierarchical_structure(df: pd.DataFrame):
         plt.title("Total sales by department")
         plt.ylabel("Total units sold")
         plt.tight_layout()
-        plt.show()
+        finalize_plot("department_sales.png")
         print("\nDepartment-level total sales:")
         print(dept_total)
 
@@ -392,7 +405,7 @@ def hierarchical_structure(df: pd.DataFrame):
         plt.title("Total sales by store")
         plt.ylabel("Total units sold")
         plt.tight_layout()
-        plt.show()
+        finalize_plot("store_sales.png")
         print("\nStore-level total sales:")
         print(store_total)
 
@@ -401,13 +414,11 @@ def hierarchical_structure(df: pd.DataFrame):
 # %% 
 def main():
     calendar, sales_train, sell_prices = load_data()
-
     calendar = prepare_calendar(calendar)
     sales_long = melt_sales_train(sales_train)
     df = merge_all(calendar, sales_long, sell_prices)
     df = optional_filter_focus(df)
 
-    df.head()
     plot_overall_trend(df)
     plot_weekly_seasonality(df)
     plot_monthly_seasonality(df)
@@ -415,6 +426,9 @@ def main():
     stl_decomposition(df)
     plot_acf_pacf_aggregate(df)
 
+    item_level_variability(df) 
+    price_dynamics(df)        
+    hierarchical_structure(df) 
 
 if __name__ == "__main__":
     main()
